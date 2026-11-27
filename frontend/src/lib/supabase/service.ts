@@ -55,7 +55,12 @@ export async function loginUser(email: string, password: string): Promise<{
       };
     }
 
-    if (res.status === 401 || res.status === 400 || (json.error && !json.error.includes("Internal"))) {
+    if (
+      res.status === 400 ||
+      res.status === 401 ||
+      res.status === 403 ||
+      (json.error && !json.error.includes("Internal"))
+    ) {
       return { user: null, error: json.error || "Invalid credentials", redirectUrl: "" };
     }
   } catch (apiErr) {
@@ -148,6 +153,12 @@ export async function loginSuperAdmin(email: string, password: string) {
 }
 
 export async function logoutUser(): Promise<void> {
+  try {
+    await fetch("/api/auth/logout", { method: "POST" });
+  } catch {
+    // ignore
+  }
+
   if (isSupabaseConfigured()) {
     try {
       const supabase = createClient();
@@ -166,6 +177,27 @@ export async function logoutUser(): Promise<void> {
 }
 
 export const logoutSuperAdmin = logoutUser;
+
+export async function getVerifiedSession(): Promise<{
+  authenticated: boolean;
+  isVerifiedSuperAdmin: boolean;
+  user: AuthUser | null;
+}> {
+  try {
+    const res = await fetch("/api/auth/session", { cache: "no-store" });
+    if (!res.ok) {
+      return { authenticated: false, isVerifiedSuperAdmin: false, user: null };
+    }
+    const json = await res.json();
+    return {
+      authenticated: Boolean(json.authenticated),
+      isVerifiedSuperAdmin: Boolean(json.isVerifiedSuperAdmin),
+      user: (json.user as AuthUser | null) ?? null,
+    };
+  } catch {
+    return { authenticated: false, isVerifiedSuperAdmin: false, user: null };
+  }
+}
 
 export async function getCurrentUser(): Promise<AuthUser | null> {
   // Check local session first
@@ -255,9 +287,10 @@ export async function addOrganization(
       return { data: savedOrg, error: null };
     }
 
-    if (json.error) {
-      console.warn("API save error:", json.error);
-    }
+    return {
+      data: null,
+      error: json.error || "Failed to save organization to database.",
+    };
   } catch (apiErr) {
     console.warn("API route exception, falling back:", apiErr);
   }
@@ -274,6 +307,51 @@ export async function addOrganization(
 
   storeLocalOrganization(newOrg);
   return { data: newOrg, error: null };
+}
+
+/**
+ * Super Admin deletes a tenant organization via the server-verified DELETE endpoint.
+ */
+export async function deleteOrganization(id: string): Promise<{
+  success: boolean;
+  error: string | null;
+}> {
+  const orgId = id?.trim();
+  if (!orgId) {
+    return { success: false, error: "Organization ID is required." };
+  }
+
+  try {
+    const res = await fetch(`/api/organizations/${encodeURIComponent(orgId)}`, {
+      method: "DELETE",
+    });
+
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok || !json.success) {
+      return {
+        success: false,
+        error: json.error || `Failed to delete organization (HTTP ${res.status}).`,
+      };
+    }
+
+    removeLocalOrganization(orgId, json.email);
+    return { success: true, error: null };
+  } catch (err: unknown) {
+    const msg =
+      err instanceof Error ? err.message : "Network error deleting organization.";
+    return { success: false, error: msg };
+  }
+}
+
+function removeLocalOrganization(id: string, email?: string) {
+  if (typeof window !== "undefined") {
+    const existing = getStoredOrganizations();
+    const targetEmail = email?.trim().toLowerCase();
+    const updated = existing.filter(
+      (o) => o.id !== id && (!targetEmail || o.email.toLowerCase() !== targetEmail)
+    );
+    localStorage.setItem(LOCAL_STORAGE_ORGS_KEY, JSON.stringify(updated));
+  }
 }
 
 function setSessionCookies(user: AuthUser) {

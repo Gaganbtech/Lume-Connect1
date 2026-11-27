@@ -9,7 +9,7 @@ export function middleware(request: NextRequest) {
   const legacySessionCookie = request.cookies.get("lume_superadmin_session")?.value;
   const hasSupabaseCookie = request.cookies
     .getAll()
-    .some((c) => c.name.startsWith("sb-") && c.name.endsWith("-auth-token"));
+    .some((c) => c.name.startsWith("sb-") && c.name.includes("-auth-token"));
 
   const isAuthenticated = Boolean(
     authSessionCookie || legacySessionCookie || hasSupabaseCookie
