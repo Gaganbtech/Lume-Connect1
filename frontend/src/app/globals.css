@@ -1,0 +1,10 @@
+:root {
+  --brand-navy: #242d53;
+  --brand-navy-dark: #1b2240;
+  --brand-gold: #d2b68d;
+  --brand-gold-hover: #c4a67d;
+}
+
+body {
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}

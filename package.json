@@ -1,0 +1,22 @@
+{
+  "name": "lume-connect",
+  "version": "1.0.0",
+  "description": "Enterprise Super Admin and Tenant Organization Management Platform",
+  "private": true,
+  "scripts": {
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "start": "npm --prefix frontend run start",
+    "lint": "npm --prefix frontend run lint"
+  },
+  "keywords": [
+    "enterprise",
+    "nextjs",
+    "supabase",
+    "multi-tenant",
+    "organization-management",
+    "superadmin-portal"
+  ],
+  "author": "TravLume",
+  "license": "UNLICENSED"
+}

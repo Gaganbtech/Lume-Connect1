@@ -1,0 +1,17 @@
+@import "tailwindcss";
+@source "../**/*.{js,ts,jsx,tsx,mdx}";
+@source "../../src/**/*.{js,ts,jsx,tsx,mdx}";
+
+:root {
+  --background: #f8fafc;
+  --foreground: #0f172a;
+  --brand-navy: #242d53;
+  --brand-navy-dark: #1b2240;
+  --brand-gold: #d2b68d;
+  --brand-gold-hover: #c4a67d;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+}
