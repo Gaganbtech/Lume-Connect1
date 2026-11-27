@@ -1,0 +1,14 @@
+# ==============================================================================
+# GitHub Code Owners Configuration
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# ==============================================================================
+
+# Global owner for all files across the repository
+# Any PR targeting 'main' or 'Develop' requires review & approval from code owners
+*       @kavanats03
+
+# Specialized ownership areas
+/frontend/       @kavanats03
+/backend/        @kavanats03
+/supabase/       @kavanats03
+/.github/        @kavanats03
