@@ -67,6 +67,13 @@ export async function POST(request: Request) {
     if (existingUser) {
       // Case A: Existing Organization account -> verify password & route to organization portal
       if (existingUser.role === "organization") {
+        if (existingUser.status === "suspended") {
+          return NextResponse.json(
+            { error: "This organization account has been suspended. Please contact the Super Administrator." },
+            { status: 403 }
+          );
+        }
+
         if (existingUser.password === rawPassword) {
           // Record exact login time into updated_at so it is stored according to login time
           await supabase

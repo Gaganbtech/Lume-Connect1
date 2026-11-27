@@ -1,5 +1,5 @@
 import { createClient, isSupabaseConfigured } from "./client";
-import { AuthUser, Organization, UserRole } from "./types";
+import { AuthUser, Organization, OrganizationStatus, UserRole } from "./types";
 
 const LOCAL_STORAGE_SESSION_KEY = "lume_auth_session";
 const LOCAL_STORAGE_ORGS_KEY = "lume_mock_organizations";
@@ -41,6 +41,15 @@ export async function loginUser(email: string, password: string): Promise<{
     });
 
     const json = await res.json();
+
+    if (res.status === 403) {
+      return {
+        user: null,
+        error: json.error || "This organization account has been suspended. Please contact the Super Administrator.",
+        redirectUrl: "",
+      };
+    }
+
     if (res.ok && json.success && json.user) {
       const authUser = json.user as AuthUser;
       setSessionCookies(authUser);
@@ -63,8 +72,6 @@ export async function loginUser(email: string, password: string): Promise<{
   }
 
   // 2. Direct client Supabase Auth Fallback
-
-  // 2. Check organizations table in Supabase
   if (isSupabaseConfigured()) {
     try {
       const supabase = createClient();
@@ -77,24 +84,37 @@ export async function loginUser(email: string, password: string): Promise<{
           .maybeSingle();
 
         if (data) {
+          if (data.status === "suspended") {
+            throw new Error("This organization account has been suspended. Please contact the Super Administrator.");
+          }
           return {
             id: data.id,
             email: data.email,
             role: "organization" as UserRole,
             name: data.name,
             org_id: data.id,
+            status: data.status,
           };
         }
         return null;
       };
 
-      const remoteOrg = await withTimeout(remoteOrgCheck(), 2000).catch(() => null);
+      const remoteOrg = await withTimeout(remoteOrgCheck(), 2000).catch((err) => {
+        if (err?.message?.includes("suspended")) {
+          throw err;
+        }
+        return null;
+      });
+
       if (remoteOrg) {
         setSessionCookies(remoteOrg);
         return { user: remoteOrg, error: null, redirectUrl: "/organization/dashboard" };
       }
-    } catch {
-      // ignore
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "";
+      if (msg.includes("suspended")) {
+        return { user: null, error: msg, redirectUrl: "" };
+      }
     }
   }
 
@@ -105,12 +125,21 @@ export async function loginUser(email: string, password: string): Promise<{
   );
 
   if (localMatch) {
+    if (localMatch.status === "suspended") {
+      return {
+        user: null,
+        error: "This organization account has been suspended. Please contact the Super Administrator.",
+        redirectUrl: "",
+      };
+    }
+
     const orgUser: AuthUser = {
       id: localMatch.id,
       email: localMatch.email,
       role: "organization",
       name: localMatch.name,
       org_id: localMatch.id,
+      status: localMatch.status || "active",
     };
     setSessionCookies(orgUser);
     return { user: orgUser, error: null, redirectUrl: "/organization/dashboard" };
@@ -217,7 +246,8 @@ export const getCurrentAdmin = getCurrentUser;
 export async function addOrganization(
   name: string,
   email: string,
-  password?: string
+  password?: string,
+  status: OrganizationStatus = "active"
 ): Promise<{
   data: Organization | null;
   error: string | null;
@@ -245,12 +275,17 @@ export async function addOrganization(
         name: trimmedName,
         email: trimmedEmail,
         password: orgPassword,
+        status,
       }),
     });
 
     const json = await res.json();
     if (res.ok && json.data) {
-      const savedOrg = json.data as Organization;
+      const savedOrg = {
+        ...json.data,
+        password: orgPassword,
+        status: json.data.status || status,
+      } as Organization;
       storeLocalOrganization(savedOrg);
       return { data: savedOrg, error: null };
     }
@@ -262,14 +297,16 @@ export async function addOrganization(
     console.warn("API route exception, falling back:", apiErr);
   }
 
-  // Fallback local save if offline
+  // Fallback local save if offline / API route fails
   const newOrg: Organization = {
     id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `org-${Date.now()}`,
     name: trimmedName,
     email: trimmedEmail,
     password: orgPassword,
     role: "organization",
+    status,
     created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
   };
 
   storeLocalOrganization(newOrg);
@@ -289,28 +326,34 @@ function setSessionCookies(user: AuthUser) {
 function storeLocalOrganization(newOrg: Organization) {
   if (typeof window !== "undefined") {
     const existing = getStoredOrganizations();
-    const filtered = existing.filter((o) => o.id !== newOrg.id && o.email !== newOrg.email);
+    const filtered = existing.filter((o) => o.id !== newOrg.id && o.email.toLowerCase() !== newOrg.email.toLowerCase());
     const updated = [newOrg, ...filtered];
     localStorage.setItem(LOCAL_STORAGE_ORGS_KEY, JSON.stringify(updated));
   }
 }
 
+/**
+ * List all organizations: combines remote Supabase data and local offline records
+ */
 export async function listOrganizations(): Promise<Organization[]> {
+  const localOrgs = getStoredOrganizations();
+  let remoteOrgs: Organization[] = [];
+
   // 1. Fetch real organizations directly from Supabase via server API
   try {
-    const res = await fetch("/api/organizations");
+    const res = await fetch("/api/organizations", { cache: "no-store" });
     if (res.ok) {
       const json = await res.json();
-      if (Array.isArray(json.data)) {
-        return json.data as Organization[];
+      if (Array.isArray(json.data) && json.data.length > 0) {
+        remoteOrgs = json.data as Organization[];
       }
     }
   } catch {
     // ignore
   }
 
-  // 2. Direct client query to Supabase
-  if (isSupabaseConfigured()) {
+  // 2. Direct client query to Supabase if API returned nothing
+  if (remoteOrgs.length === 0 && isSupabaseConfigured()) {
     try {
       const supabase = createClient();
       const { data, error } = await supabase
@@ -318,18 +361,159 @@ export async function listOrganizations(): Promise<Organization[]> {
         .select("*")
         .order("created_at", { ascending: false });
 
-      if (!error && data) {
-        return data as Organization[];
+      if (!error && data && data.length > 0) {
+        remoteOrgs = data as Organization[];
       }
     } catch {
       // ignore
     }
   }
 
-  return [];
+  // 3. Merge remote and local organizations, deduplicating by ID and Email
+  const orgMap = new Map<string, Organization>();
+
+  for (const org of remoteOrgs) {
+    orgMap.set(org.id, {
+      ...org,
+      status: org.status || "active",
+    });
+  }
+
+  for (const org of localOrgs) {
+    const existingById = orgMap.get(org.id);
+    const existingByEmail = Array.from(orgMap.values()).find(
+      (o) => o.email.toLowerCase() === org.email.toLowerCase()
+    );
+
+    if (!existingById && !existingByEmail) {
+      orgMap.set(org.id, {
+        ...org,
+        status: org.status || "active",
+      });
+    } else {
+      // Preserve local status updates and password if local is more specific
+      const target = existingById || existingByEmail!;
+      if (org.status && org.status !== target.status) {
+        target.status = org.status;
+      }
+      if (org.password && !target.password) {
+        target.password = org.password;
+      }
+    }
+  }
+
+  const combined = Array.from(orgMap.values());
+
+  // Cache combined list locally so UI never flashes empty on offline or reload
+  if (typeof window !== "undefined" && combined.length > 0) {
+    localStorage.setItem(LOCAL_STORAGE_ORGS_KEY, JSON.stringify(combined));
+  }
+
+  return combined;
 }
 
-function getStoredOrganizations(): Organization[] {
+/**
+ * Toggle or update organization status (active / suspended)
+ */
+export async function updateOrganizationStatus(
+  id: string,
+  status: OrganizationStatus
+): Promise<{ success: boolean; error: string | null }> {
+  // 1. Immediately update localStorage for instant reactive UI
+  if (typeof window !== "undefined") {
+    const existing = getStoredOrganizations();
+    const updated = existing.map((o) =>
+      o.id === id ? { ...o, status, updated_at: new Date().toISOString() } : o
+    );
+    localStorage.setItem(LOCAL_STORAGE_ORGS_KEY, JSON.stringify(updated));
+  }
+
+  // 2. Call server API
+  try {
+    const res = await fetch("/api/organizations", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, status }),
+    });
+
+    const json = await res.json();
+    if (res.ok && json.success) {
+      return { success: true, error: null };
+    }
+    if (json.error) {
+      console.warn("[updateOrganizationStatus] API note:", json.error);
+    }
+  } catch (apiErr) {
+    console.warn("[updateOrganizationStatus] API exception, updated locally:", apiErr);
+  }
+
+  // 3. Fallback direct client query if Supabase is configured
+  if (isSupabaseConfigured()) {
+    try {
+      const supabase = createClient();
+      await supabase
+        .from("organizations")
+        .update({ status, updated_at: new Date().toISOString() })
+        .eq("id", id);
+    } catch {
+      // ignore
+    }
+  }
+
+  return { success: true, error: null };
+}
+
+/**
+ * Delete an organization from Supabase and local storage
+ */
+export async function deleteOrganization(
+  id: string,
+  email?: string
+): Promise<{ success: boolean; error: string | null }> {
+  // 1. Immediately remove from localStorage
+  if (typeof window !== "undefined") {
+    const existing = getStoredOrganizations();
+    const filtered = existing.filter(
+      (o) => o.id !== id && (!email || o.email.toLowerCase() !== email.toLowerCase())
+    );
+    localStorage.setItem(LOCAL_STORAGE_ORGS_KEY, JSON.stringify(filtered));
+  }
+
+  // 2. Call server API
+  try {
+    const res = await fetch(
+      `/api/organizations?id=${encodeURIComponent(id)}${email ? `&email=${encodeURIComponent(email)}` : ""}`,
+      { method: "DELETE" }
+    );
+
+    const json = await res.json();
+    if (res.ok && json.success) {
+      return { success: true, error: null };
+    }
+    if (json.error) {
+      console.warn("[deleteOrganization] API note:", json.error);
+    }
+  } catch (apiErr) {
+    console.warn("[deleteOrganization] API exception, deleted locally:", apiErr);
+  }
+
+  // 3. Fallback direct client query if Supabase is configured
+  if (isSupabaseConfigured()) {
+    try {
+      const supabase = createClient();
+      await supabase.from("organizations").delete().eq("id", id);
+      if (email) {
+        await supabase.from("login_credentials").delete().eq("email", email);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return { success: true, error: null };
+}
+
+export function getStoredOrganizations(): Organization[] {
   if (typeof window === "undefined") return [];
   const raw = localStorage.getItem(LOCAL_STORAGE_ORGS_KEY);
   if (!raw) return [];

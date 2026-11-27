@@ -11,9 +11,13 @@ CREATE TABLE IF NOT EXISTS public.organizations (
     email TEXT NOT NULL UNIQUE,
     password TEXT,
     role TEXT NOT NULL DEFAULT 'organization',
+    status TEXT NOT NULL DEFAULT 'active',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now())
 );
+
+-- Ensure status column exists if table was previously created
+ALTER TABLE public.organizations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
 
 ALTER TABLE public.organizations ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Allow all for organizations" ON public.organizations;
