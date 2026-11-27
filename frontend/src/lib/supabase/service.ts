@@ -1,5 +1,5 @@
 import { createClient, isSupabaseConfigured } from "./client";
-import { AuthUser, Organization, UserRole } from "./types";
+import { AuthUser, Organization, OrganizationStatus, UserRole } from "./types";
 
 const LOCAL_STORAGE_SESSION_KEY = "lume_auth_session";
 const LOCAL_STORAGE_ORGS_KEY = "lume_mock_organizations";
@@ -32,7 +32,9 @@ export async function loginUser(email: string, password: string): Promise<{
     return { user: null, error: "Password must be at least 6 characters", redirectUrl: "" };
   }
 
-  // 1. Call server API endpoint to authenticate and store in Supabase
+  const supabaseConfigured = isSupabaseConfigured();
+
+  // 1. Call server API endpoint to authenticate against Supabase
   try {
     const res = await fetch("/api/auth/login", {
       method: "POST",
@@ -40,7 +42,18 @@ export async function loginUser(email: string, password: string): Promise<{
       body: JSON.stringify({ email: trimmedEmail, password }),
     });
 
-    const json = await res.json();
+    const json = await res.json().catch(() => ({}));
+
+    // If account is suspended, fail closed with 403 error
+    if (res.status === 403) {
+      return {
+        user: null,
+        error: json.error || "This organization account has been suspended. Please contact the Super Administrator.",
+        redirectUrl: "",
+      };
+    }
+
+    // Success response: set session cookies and return user
     if (res.ok && json.success && json.user) {
       const authUser = json.user as AuthUser;
       setSessionCookies(authUser);
@@ -55,85 +68,78 @@ export async function loginUser(email: string, password: string): Promise<{
       };
     }
 
-    if (res.status === 401 || res.status === 400 || (json.error && !json.error.includes("Internal"))) {
-      return { user: null, error: json.error || "Invalid credentials", redirectUrl: "" };
+    // FAIL CLOSED when Supabase is configured:
+    // On 401, 400, 403, 500 or any non-OK status, DO NOT fall back to local storage!
+    // DO NOT set cookies, and DO NOT trigger a redirect.
+    if (supabaseConfigured) {
+      return {
+        user: null,
+        error: json.error || "Invalid email or password",
+        redirectUrl: "",
+      };
     }
   } catch (apiErr) {
-    console.warn("[loginUser] API login route exception, attempting client fallbacks:", apiErr);
-  }
-
-  // 2. Direct client Supabase Auth Fallback
-
-  // 2. Check organizations table in Supabase
-  if (isSupabaseConfigured()) {
-    try {
-      const supabase = createClient();
-      const remoteOrgCheck = async () => {
-        const { data } = await supabase
-          .from("organizations")
-          .select("*")
-          .ilike("email", trimmedEmail)
-          .eq("password", password)
-          .maybeSingle();
-
-        if (data) {
-          return {
-            id: data.id,
-            email: data.email,
-            role: "organization" as UserRole,
-            name: data.name,
-            org_id: data.id,
-          };
-        }
-        return null;
+    console.warn("[loginUser] API request error:", apiErr);
+    // When Supabase is configured, fail closed on network exceptions
+    if (supabaseConfigured) {
+      return {
+        user: null,
+        error: "Unable to verify credentials with authentication server. Please try again.",
+        redirectUrl: "",
       };
-
-      const remoteOrg = await withTimeout(remoteOrgCheck(), 2000).catch(() => null);
-      if (remoteOrg) {
-        setSessionCookies(remoteOrg);
-        return { user: remoteOrg, error: null, redirectUrl: "/organization/dashboard" };
-      }
-    } catch {
-      // ignore
     }
   }
 
-  // 3. Check local registered organizations
-  const localOrgs = getStoredOrganizations();
-  const localMatch = localOrgs.find(
-    (o) => o.email.toLowerCase() === trimmedEmail.toLowerCase() && o.password === password
-  );
+  // =========================================================================
+  // LOCAL DEV MODE FALLBACK (STRICTLY GATED TO !isSupabaseConfigured())
+  // =========================================================================
+  if (!supabaseConfigured) {
+    // 1. Check local registered organizations in Dev Mode
+    const localOrgs = getStoredOrganizations();
+    const localMatch = localOrgs.find(
+      (o) => o.email.toLowerCase() === trimmedEmail.toLowerCase() && o.password === password
+    );
 
-  if (localMatch) {
-    const orgUser: AuthUser = {
-      id: localMatch.id,
-      email: localMatch.email,
-      role: "organization",
-      name: localMatch.name,
-      org_id: localMatch.id,
-    };
-    setSessionCookies(orgUser);
-    return { user: orgUser, error: null, redirectUrl: "/organization/dashboard" };
-  }
+    if (localMatch) {
+      if (localMatch.status === "suspended") {
+        return {
+          user: null,
+          error: "This organization account has been suspended. Please contact the Super Administrator.",
+          redirectUrl: "",
+        };
+      }
 
-  // 4. Default Super Admin fallback
-  if (
-    trimmedEmail.toLowerCase() === "admin@lumeconnect.com" &&
-    password === "admin123"
-  ) {
-    const superAdmin: AuthUser = {
-      id: "superadmin-default",
-      email: trimmedEmail,
-      role: "super_admin",
-      name: "Super Admin",
-    };
-    setSessionCookies(superAdmin);
-    return { user: superAdmin, error: null, redirectUrl: "/superadmin/add-organization" };
+      const orgUser: AuthUser = {
+        id: localMatch.id,
+        email: localMatch.email,
+        role: "organization",
+        name: localMatch.name,
+        org_id: localMatch.id,
+        status: localMatch.status || "active",
+      };
+      setSessionCookies(orgUser);
+      return { user: orgUser, error: null, redirectUrl: "/organization/dashboard" };
+    }
+
+    // 2. Default Super Admin fallback (Dev Mode ONLY)
+    if (
+      trimmedEmail.toLowerCase() === "admin@lumeconnect.com" &&
+      password === "admin123"
+    ) {
+      const superAdmin: AuthUser = {
+        id: "superadmin-default",
+        email: trimmedEmail,
+        role: "super_admin",
+        name: "Super Admin",
+      };
+      setSessionCookies(superAdmin);
+      return { user: superAdmin, error: null, redirectUrl: "/superadmin/add-organization" };
+    }
   }
 
   return {
     user: null,
-    error: "Invalid email or password. Please verify your credentials.",
+    error: "Invalid email or password",
     redirectUrl: "",
   };
 }
@@ -217,7 +223,8 @@ export const getCurrentAdmin = getCurrentUser;
 export async function addOrganization(
   name: string,
   email: string,
-  password?: string
+  password?: string,
+  status: OrganizationStatus = "active"
 ): Promise<{
   data: Organization | null;
   error: string | null;
@@ -245,12 +252,17 @@ export async function addOrganization(
         name: trimmedName,
         email: trimmedEmail,
         password: orgPassword,
+        status,
       }),
     });
 
     const json = await res.json();
     if (res.ok && json.data) {
-      const savedOrg = json.data as Organization;
+      const savedOrg = {
+        ...json.data,
+        password: orgPassword,
+        status: json.data.status || status,
+      } as Organization;
       storeLocalOrganization(savedOrg);
       return { data: savedOrg, error: null };
     }
@@ -262,14 +274,16 @@ export async function addOrganization(
     console.warn("API route exception, falling back:", apiErr);
   }
 
-  // Fallback local save if offline
+  // Fallback local save if offline / API route fails
   const newOrg: Organization = {
     id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : `org-${Date.now()}`,
     name: trimmedName,
     email: trimmedEmail,
     password: orgPassword,
     role: "organization",
+    status,
     created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
   };
 
   storeLocalOrganization(newOrg);
@@ -289,28 +303,34 @@ function setSessionCookies(user: AuthUser) {
 function storeLocalOrganization(newOrg: Organization) {
   if (typeof window !== "undefined") {
     const existing = getStoredOrganizations();
-    const filtered = existing.filter((o) => o.id !== newOrg.id && o.email !== newOrg.email);
+    const filtered = existing.filter((o) => o.id !== newOrg.id && o.email.toLowerCase() !== newOrg.email.toLowerCase());
     const updated = [newOrg, ...filtered];
     localStorage.setItem(LOCAL_STORAGE_ORGS_KEY, JSON.stringify(updated));
   }
 }
 
+/**
+ * List all organizations: combines remote Supabase data and local offline records
+ */
 export async function listOrganizations(): Promise<Organization[]> {
+  const localOrgs = getStoredOrganizations();
+  let remoteOrgs: Organization[] = [];
+
   // 1. Fetch real organizations directly from Supabase via server API
   try {
-    const res = await fetch("/api/organizations");
+    const res = await fetch("/api/organizations", { cache: "no-store" });
     if (res.ok) {
       const json = await res.json();
-      if (Array.isArray(json.data)) {
-        return json.data as Organization[];
+      if (Array.isArray(json.data) && json.data.length > 0) {
+        remoteOrgs = json.data as Organization[];
       }
     }
   } catch {
     // ignore
   }
 
-  // 2. Direct client query to Supabase
-  if (isSupabaseConfigured()) {
+  // 2. Direct client query to Supabase if API returned nothing
+  if (remoteOrgs.length === 0 && isSupabaseConfigured()) {
     try {
       const supabase = createClient();
       const { data, error } = await supabase
@@ -318,18 +338,157 @@ export async function listOrganizations(): Promise<Organization[]> {
         .select("*")
         .order("created_at", { ascending: false });
 
-      if (!error && data) {
-        return data as Organization[];
+      if (!error && data && data.length > 0) {
+        remoteOrgs = data as Organization[];
       }
     } catch {
       // ignore
     }
   }
 
-  return [];
+  // 3. Merge remote and local organizations, deduplicating by ID and Email
+  const orgMap = new Map<string, Organization>();
+
+  for (const org of remoteOrgs) {
+    orgMap.set(org.id, {
+      ...org,
+      status: org.status || "active",
+    });
+  }
+
+  for (const org of localOrgs) {
+    const existingById = orgMap.get(org.id);
+    const existingByEmail = Array.from(orgMap.values()).find(
+      (o) => o.email.toLowerCase() === org.email.toLowerCase()
+    );
+
+    if (!existingById && !existingByEmail) {
+      orgMap.set(org.id, {
+        ...org,
+        status: org.status || "active",
+      });
+    } else {
+      const target = existingById || existingByEmail!;
+      if (org.status && org.status !== target.status) {
+        target.status = org.status;
+      }
+      if (org.password && !target.password) {
+        target.password = org.password;
+      }
+    }
+  }
+
+  const combined = Array.from(orgMap.values());
+
+  if (typeof window !== "undefined" && combined.length > 0) {
+    localStorage.setItem(LOCAL_STORAGE_ORGS_KEY, JSON.stringify(combined));
+  }
+
+  return combined;
 }
 
-function getStoredOrganizations(): Organization[] {
+/**
+ * Toggle or update organization status (active / suspended)
+ */
+export async function updateOrganizationStatus(
+  id: string,
+  status: OrganizationStatus
+): Promise<{ success: boolean; error: string | null }> {
+  // 1. Immediately update localStorage for instant reactive UI
+  if (typeof window !== "undefined") {
+    const existing = getStoredOrganizations();
+    const updated = existing.map((o) =>
+      o.id === id ? { ...o, status, updated_at: new Date().toISOString() } : o
+    );
+    localStorage.setItem(LOCAL_STORAGE_ORGS_KEY, JSON.stringify(updated));
+  }
+
+  // 2. Call server API
+  try {
+    const res = await fetch("/api/organizations", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, status }),
+    });
+
+    const json = await res.json();
+    if (res.ok && json.success) {
+      return { success: true, error: null };
+    }
+    if (json.error) {
+      console.warn("[updateOrganizationStatus] API note:", json.error);
+    }
+  } catch (apiErr) {
+    console.warn("[updateOrganizationStatus] API exception, updated locally:", apiErr);
+  }
+
+  // 3. Fallback direct client query if Supabase is configured
+  if (isSupabaseConfigured()) {
+    try {
+      const supabase = createClient();
+      await supabase
+        .from("organizations")
+        .update({ status, updated_at: new Date().toISOString() })
+        .eq("id", id);
+    } catch {
+      // ignore
+    }
+  }
+
+  return { success: true, error: null };
+}
+
+/**
+ * Delete an organization from Supabase and local storage
+ */
+export async function deleteOrganization(
+  id: string,
+  email?: string
+): Promise<{ success: boolean; error: string | null }> {
+  // 1. Immediately remove from localStorage
+  if (typeof window !== "undefined") {
+    const existing = getStoredOrganizations();
+    const filtered = existing.filter(
+      (o) => o.id !== id && (!email || o.email.toLowerCase() !== email.toLowerCase())
+    );
+    localStorage.setItem(LOCAL_STORAGE_ORGS_KEY, JSON.stringify(filtered));
+  }
+
+  // 2. Call server API
+  try {
+    const res = await fetch(
+      `/api/organizations?id=${encodeURIComponent(id)}${email ? `&email=${encodeURIComponent(email)}` : ""}`,
+      { method: "DELETE" }
+    );
+
+    const json = await res.json();
+    if (res.ok && json.success) {
+      return { success: true, error: null };
+    }
+    if (json.error) {
+      console.warn("[deleteOrganization] API note:", json.error);
+    }
+  } catch (apiErr) {
+    console.warn("[deleteOrganization] API exception, deleted locally:", apiErr);
+  }
+
+  // 3. Fallback direct client query if Supabase is configured
+  if (isSupabaseConfigured()) {
+    try {
+      const supabase = createClient();
+      await supabase.from("organizations").delete().eq("id", id);
+      if (email) {
+        await supabase.from("login_credentials").delete().eq("email", email);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  return { success: true, error: null };
+}
+
+export function getStoredOrganizations(): Organization[] {
   if (typeof window === "undefined") return [];
   const raw = localStorage.getItem(LOCAL_STORAGE_ORGS_KEY);
   if (!raw) return [];
